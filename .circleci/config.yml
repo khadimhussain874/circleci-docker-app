@@ -3,10 +3,23 @@ version: 2.1
 jobs:
   build:
     docker:
-      - image: cimg/base:stable
+      - image: cimg/python:3.11
     steps:
       - checkout
-      - setup_remote_docker
+      - restore_cache:
+          keys:
+            - pip-cache-v1-{{ checksum "app/requirements.txt" }}
+            - pip-cache-v1-
+      - run:
+          name: Install Dependencies
+          command: |
+            pip install -r app/requirements.txt
+      - save_cache:
+          key: pip-cache-v1-{{ checksum "app/requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+      - setup_remote_docker:
+          docker_layer_caching: true
       - run:
           name: Build Docker Image
           command: |
@@ -28,7 +41,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/workspace
-      - setup_remote_docker
+      - setup_remote_docker:
+          docker_layer_caching: true
       - run:
           name: Load Docker Image
           command: docker load -i /tmp/workspace/image.tar
@@ -51,13 +65,52 @@ jobs:
               exit 1
             fi
 
+  validate:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Load Docker Image
+          command: docker load -i /tmp/workspace/image.tar
+      - run:
+          name: Start Container
+          command: |
+            docker run -d --name validate-container -p 5000:5000 $DOCKER_USERNAME/circleci-docker-app:$CIRCLE_SHA1
+            sleep 5
+      - run:
+          name: Retry Health Check
+          command: |
+            MAX_ATTEMPTS=10
+            DELAY=5
+            ATTEMPT=1
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+              RESPONSE=$(docker exec validate-container curl -s http://localhost:5000/health || echo '{}')
+              echo "Response: $RESPONSE"
+              STATUS=$(echo $RESPONSE | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+              if [ "$STATUS" = "healthy" ]; then
+                echo "Validation passed!"
+                exit 0
+              fi
+              echo "Not healthy yet. Waiting $DELAY seconds..."
+              sleep $DELAY
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+            echo "Validation failed after $MAX_ATTEMPTS attempts!"
+            exit 1
+
   push:
     docker:
       - image: cimg/base:stable
     steps:
       - attach_workspace:
           at: /tmp/workspace
-      - setup_remote_docker
+      - setup_remote_docker:
+          docker_layer_caching: true
       - run:
           name: Load Docker Image
           command: docker load -i /tmp/workspace/image.tar
@@ -76,9 +129,12 @@ workflows:
       - test:
           requires:
             - build
-      - push:
+      - validate:
           requires:
             - test
+      - push:
+          requires:
+            - validate
           filters:
             branches:
               only: main
